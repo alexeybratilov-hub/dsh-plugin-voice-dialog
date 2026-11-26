@@ -32,6 +32,8 @@
                   "lib/*.js",
                   "locale/*.json",
                   "docs/*.md",
+                  "docs/*.png",
+                  "docs/demo/*.wav",
                   "scripts/*.mjs",
                   "scripts/*.ps1",
                   "engine/tts/*.py",
