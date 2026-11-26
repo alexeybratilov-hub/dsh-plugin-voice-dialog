@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Voice dialog",
+    "description": "Talk to the assistant by voice in three microphone modes: continuous dialog, hold to talk, or tap to record. Recognition is local (Whisper via sherpa-onnx); replies are spoken by Silero v5 with punctuation-driven pauses and five voices. Everything runs on this computer; audio never leaves it."
+  }
+}

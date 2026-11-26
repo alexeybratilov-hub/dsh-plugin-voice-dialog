@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36" fill="none">
+  <defs>
+    <mask id="voice-dialog-ears" maskUnits="userSpaceOnUse" x="0" y="0" width="36" height="36">
+      <rect width="36" height="36" fill="#fff"/>
+      <circle cx="8.25" cy="9.45" r="2.7" fill="#000"/>
+      <circle cx="27.75" cy="9.45" r="2.7" fill="#000"/>
+    </mask>
+  </defs>
+  <g mask="url(#voice-dialog-ears)">
+    <path d="M18 8.7C21.9 8.175 24.9 9.075 27 11.1C30.6 14.1 32.55 18 33 22.2C33.45 26.85 31.65 31.5 28.05 33.3C25.05 34.65 21.45 35.025 18 35.025C14.55 35.025 10.95 34.65 7.95 33.3C4.35 31.5 2.55 26.85 3 22.2C3.45 18 5.4 14.1 9 11.1C11.1 9.075 14.1 8.175 18 8.7Z"
+          stroke="#247bbf" stroke-width="2.25" stroke-linejoin="round"/>
+  </g>
+  <circle cx="8.25" cy="9.45" r="2.85" stroke="#247bbf" stroke-width="2.25"/>
+  <circle cx="27.75" cy="9.45" r="2.85" stroke="#247bbf" stroke-width="2.25"/>
+  <path d="M17.325 9.075 17.925 7.725M18.675 9.075 18.075 7.725" stroke="#247bbf" stroke-width="1.725" stroke-linecap="round"/>
+  <path d="M10.95 19.155Q13.2 20.745 15.45 19.155" stroke="#247bbf" stroke-width="2.175" stroke-linecap="round"/>
+  <path d="M20.55 19.155Q22.8 20.745 25.05 19.155" stroke="#247bbf" stroke-width="2.175" stroke-linecap="round"/>
+  <ellipse cx="16.275" cy="23" rx="0.405" ry="0.645" fill="#247bbf"/>
+  <ellipse cx="19.725" cy="23" rx="0.405" ry="0.645" fill="#247bbf"/>
+  <path d="M18 23.4V28.35M18 28.35l-.57.45M18 28.35l.57.45" stroke="#247bbf" stroke-width="1.5" stroke-linecap="round"/>
+</svg>

@@ -1,0 +1,14 @@
+# Голосовые движки и модели не входят в репозиторий: их ставит setup-скрипт.
+engine/models/
+engine/sherpa-onnx-v2.0.3-win-x64-shared-MT-Release/
+engine/tts/.venv/
+engine/tts/models/
+engine/tts/runtime/
+engine/tmp/
+engine/_disabled/
+dist/
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
