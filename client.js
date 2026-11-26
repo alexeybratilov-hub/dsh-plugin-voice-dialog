@@ -121,6 +121,7 @@ window.__ModuleLoader__.load({
         micDenied: 'Браузер не дал доступ к микрофону. Разрешите его в настройках сайта.',
         micMissing: 'Микрофон не найден.',
         micBusy: 'Микрофон занят — подождите секунду и нажмите ещё раз.',
+        micFailed: 'Не удалось открыть микрофон — попробую ещё раз через пару секунд.',
         network: 'Локальный движок недоступен. Проверьте, что плагин «Голосовой диалог» включён.',
         engineError: 'Ошибка движка',
         submitError: 'Не удалось отправить сообщение',
@@ -275,6 +276,7 @@ window.__ModuleLoader__.load({
         micDenied: 'The browser denied microphone access. Allow it in the site settings.',
         micMissing: 'No microphone found.',
         micBusy: 'The microphone is busy — wait a second and press again.',
+        micFailed: 'Could not open the microphone — retrying in a couple of seconds.',
         network: 'Local engine unavailable. Check that the Voice dialog plugin is enabled.',
         engineError: 'Engine error',
         submitError: 'Could not send the message',
@@ -1056,6 +1058,19 @@ window.__ModuleLoader__.load({
         },
         /** Идемпотентно запустить прослушивание кодового слова. */
         async ensureWake() {
+          // Захват мог умереть (перезагрузка контекста, ошибка устройства), но
+          // остаться в поле: иначе прослушивание «включено», а микрофон глухой.
+          const stale = runtime.wakeCapture
+          if (stale && (!stale.context || !stale.context.state || stale.context.state === 'closed')) {
+            runtime.wakeCapture = undefined
+            try { await stale.dispose() } catch { /* уже закрыт */ }
+          }
+          // Тот же самолечащийся подход для слушателя «пока думаю».
+          const staleThink = runtime.thinkCapture
+          if (staleThink && (!staleThink.context || !staleThink.context.state || staleThink.context.state === 'closed')) {
+            runtime.thinkCapture = undefined
+            try { await staleThink.dispose() } catch { /* уже закрыт */ }
+          }
           if (runtime.wakeCapture || runtime.wakeBusy) return
           // Состояние могло рассинхронизироваться: флаг «слушаю» без потока.
           if (!runtime.wakeCapture && store.get().wakeListening) store.set({ wakeListening: false })
@@ -1090,25 +1105,29 @@ window.__ModuleLoader__.load({
             // Небольшая пауза и снова: постоянно открытый микрофон важнее.
             runtime.wakeNextAt = Date.now() + 1500
             runtime.wakeFails += 1
+            runtime.lastCaptureError = String(error && error.message ? error.message : error).slice(0, 48)
             // Один раз объясняем, почему молчит, а не повторяем бесконечно.
-            if (!runtime.wakeFailNotified) {
+            const recentlyWorked = Date.now() - (runtime.lastCaptureOkAt ?? 0) < 10000
+            if (!runtime.wakeFailNotified && runtime.wakeFails >= 3 && !recentlyWorked) {
               runtime.wakeFailNotified = true
               const strings = store.get().strings
               const message = error instanceof CaptureError && error.message === 'permission' ? strings.micDenied
                 : error instanceof CaptureError && error.message === 'missing' ? strings.micMissing
                   : error instanceof CaptureError && error.message === 'busy' ? strings.micBusy
-                    : strings.network
+                    : strings.micFailed
               controller.fail(message)
             }
             return
           }
           runtime.wakeFailNotified = false
+          runtime.lastCaptureOkAt = Date.now()
           runtime.wakeStarts += 1
           if (runtime.wakeCapture !== capture) { await capture.dispose(); return }
           const captureStartedAt = Date.now()
           runtime.wakeStartedAt = captureStartedAt
           store.set({ wakeListening: true })
           runtime.wakeChimed = false
+          runtime.wakeConfirm = 0
           runtime.wakeHost = undefined
           capture.detachWake = controller.startWakeStreaming(capture)
           // Если дорожка микрофона оборвалась, сразу переоткрываем поток,
@@ -1232,6 +1251,8 @@ window.__ModuleLoader__.load({
                   speech: value.speech === true,
                   silenceMs: Number(value.silenceMs) || 0,
                   spoken: value.spoken === true,
+                  score: Number.isFinite(Number(value.score)) ? Number(value.score) : undefined,
+                  level: runtime.wakeChunkLevel ?? 0,
                   at: Date.now(),
                 }
                 if (update.text !== runtime.wakeLastText) {
@@ -1241,12 +1262,28 @@ window.__ModuleLoader__.load({
                 if (typeof onUpdate === 'function') { onUpdate(update); return }
                 runtime.wakeHost = update
                 // Своя KWS-модель: хост отдаёт вероятность имени на последних 1,5 с.
-                const trigger = Number(value.kws) > 0 ? Number(value.kws) : 0.85
+                // Порог поднят до 0,9, а пограничные срабатывания требуют
+                // подтверждения вторым окном: одиночный «похожий» кусок
+                // фоновой речи больше не открывает запись.
+                const trigger = Math.max(0.9, Number(value.kws) > 0 ? Number(value.kws) : 0.9)
                 if (typeof value.score === 'number') store.set({ wakeScore: value.score })
                 if (typeof value.score === 'number' && value.score >= trigger && !runtime.wakeChimed) {
-                  runtime.wakeChimed = true
-                  runtime.wakeHits += 1
-                  void controller.wakeActivate()
+                  const now = Date.now()
+                  const strong = value.score >= trigger + 0.06
+                  const previous = runtime.wakeConfirm ?? 0
+                  if (strong || (previous > 0 && now - previous >= 350 && now - previous <= 2000)) {
+                    runtime.wakeConfirm = 0
+                    runtime.wakeChimed = true
+                    runtime.wakeHits += 1
+                    runtime.wakeHitSource = 'kws'
+                    void controller.wakeActivate()
+                  } else if (previous === 0) {
+                    // Первое окно выше порога — ждём подтверждения, но не долго.
+                    runtime.wakeConfirm = now
+                    setTimeout(() => { if (runtime.wakeConfirm === now) runtime.wakeConfirm = 0 }, 2000)
+                  }
+                } else if (typeof value.score === 'number' && value.score < trigger * 0.9) {
+                  runtime.wakeConfirm = 0
                 }
                 if (update.text !== '') controller.wakePartial(update.text)
               })
@@ -1288,6 +1325,9 @@ window.__ModuleLoader__.load({
                 ring.base += dropped.length
               }
             }
+            let sumSquares = 0
+            for (let index = 0; index < pcm.length; index += 1) sumSquares += pcm[index] * pcm[index]
+            runtime.wakeChunkLevel = Math.sqrt(sumSquares / Math.max(1, pcm.length)) / 32767
             pending.push(pcm)
             flush()
           }
@@ -1576,6 +1616,40 @@ window.__ModuleLoader__.load({
             return String(payload.text ?? '')
           } catch { return '' }
         },
+        /**
+         * Вероятность имени на готовой WAV-записи через ту же KWS-модель,
+         * что слушает микрофон. Нужна для прерывания во время чтения: короткое
+         * «Валера» распознаватель часто не берёт, а модель слышит уверенно.
+         */
+        async scoreWave(wave) {
+          try {
+            const bytes = new Uint8Array(wave instanceof ArrayBuffer ? wave : await wave.arrayBuffer())
+            // Ищем data-чанк: заголовок WAV может быть длиннее 44 байт.
+            let offset = -1
+            let length = 0
+            for (let index = 12; index + 8 <= bytes.length;) {
+              const id = String.fromCharCode(bytes[index], bytes[index + 1], bytes[index + 2], bytes[index + 3])
+              const size = bytes[index + 4] | (bytes[index + 5] << 8) | (bytes[index + 6] << 16) | (bytes[index + 7] << 24)
+              if (id === 'data') { offset = index + 8; length = Math.min(size, bytes.length - offset); break }
+              index += 8 + size + (size % 2)
+            }
+            if (offset < 0 || length <= 0) return undefined
+            // KWS-модель смотрит окно 1,5 с: короткий кусок добиваем тишиной.
+            const target = 16000 * 2 * 1.5
+            const pcm = new Uint8Array(Math.max(length, target))
+            pcm.set(bytes.subarray(offset, offset + length))
+            const response = await fetch(`${BASE}/wake`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/octet-stream', 'x-wake-key': `barge-${Date.now()}` },
+              body: pcm.buffer,
+              signal: AbortSignal.timeout(8000),
+            })
+            if (!response.ok) return undefined
+            const value = await response.json().catch(() => ({}))
+            const score = Number(value.score)
+            return Number.isFinite(score) ? score : undefined
+          } catch { return undefined }
+        },
         /** Слушать имя, пока модель думает: можно обратиться, не дожидаясь ответа. */
         async startThinkListen() {
           if (runtime.thinkCapture || runtime.thinkBusy) return
@@ -1694,7 +1768,7 @@ window.__ModuleLoader__.load({
             runtime.audioCancel?.(new DOMException('canceled', 'AbortError'))
           }, 1500)
         },
-        /** Слушать микрофон во время чтения ответа ради кодового слова. */
+        /** Слушать кодовое слово во время чтения: только «Валера», как Алиса. */
         async startBarge() {
           if (runtime.bargeCapture || runtime.bargeBusy) return
           if (store.get().preferences.bargeIn === false) return
@@ -1705,60 +1779,123 @@ window.__ModuleLoader__.load({
           runtime.bargeCapture = capture
           try {
             await capture.start()
-          } catch {
+          } catch (error) {
+            runtime.bargeError = String(error && error.message ? error.message : error).slice(0, 40)
             if (runtime.bargeCapture === capture) runtime.bargeCapture = undefined
             await capture.dispose()
             return
           }
           if (runtime.bargeCapture !== capture) { await capture.dispose(); return }
-          const threshold = (THRESHOLDS[store.get().preferences.sensitivity] ?? THRESHOLDS.normal) * 1.4
           const startedAt = Date.now()
-          let heard = false
-          let speechStarted = 0
-          let lastVoice = Date.now()
-          let paused = false
-          let loudTicks = 0
+          runtime.bargeStarts = (runtime.bargeStarts ?? 0) + 1
+          runtime.bargeScores = 0
+          runtime.bargeBest = 0
+          runtime.bargePeak = 0
+          runtime.bargeError = ''
+          runtime.bargeEcho = 0
+          runtime.bargeEchoGain = undefined
+          runtime.bargeHistory = []
+          // Оцениваем эхо по первым ~800 мс, пока человек молчит: в микрофоне
+          // сейчас только мой голос из колонок. Этот коэффициент помогает
+          // отличать твой голос от моего, не трогая громкость ответа.
           clearInterval(runtime.bargeTimer)
           runtime.bargeTimer = setInterval(() => {
             if (runtime.bargeCapture !== capture || store.get().phase !== 'speaking') {
               clearInterval(runtime.bargeTimer)
               return
             }
-            const now = Date.now()
-            if (now < selfSoundUntil) return
-            // Первые 700 мс не слушаем: даём эху и началу фразы устояться.
-            if (!paused && now - startedAt < 700) return
-            capture.resume()
             const level = capture.amplitude()
-            if (level >= threshold) {
-              loudTicks += 1
-              if (!heard) speechStarted = now
-              heard = true
-              lastVoice = now
-              // Пауза только после ~240 мс речи и не больше двух раз за чтение:
-              // иначе собственное эхо из колонок бесконечно ставит ответ на паузу.
-              if (!paused && loudTicks >= 3 && runtime.bargeTriggers < 2) {
-                paused = true
-                runtime.bargeTriggers += 1
-                controller.pauseSpeaking()
+            runtime.bargePeak = Math.max(runtime.bargePeak ?? 0, level)
+            const output = controller.outputLevel()
+            const history = runtime.bargeHistory
+            history.push([level, output])
+            if (history.length > 40) history.shift()
+            if (runtime.bargeEchoGain === undefined && history.length >= 6) {
+              let numerator = 0
+              let denominator = 0
+              for (const sample of history) {
+                if (sample[1] < 0.004) continue
+                numerator += sample[1] * sample[0]
+                denominator += sample[1] * sample[1]
               }
-            } else {
-              loudTicks = 0
+              runtime.bargeEchoGain = denominator > 0 ? Math.min(3, numerator / denominator) : 0
             }
-            if (heard && now - lastVoice >= 700 && now - speechStarted >= 300) {
-              void controller.finishBarge(capture, {
-                startMs: Math.max(0, speechStarted - 400 - startedAt),
-                endMs: Math.max(0, lastVoice + 700 - startedAt),
-              })
+            if (runtime.bargeEchoGain !== undefined) runtime.bargeEcho = runtime.bargeEchoGain * output
+          }, 80)
+          // Имя определяет та же KWS-модель, что и обычную активацию: реакция
+          // только на «Валеру», а не на громкость и не на другие слова.
+          capture.detachWake = controller.startWakeStreaming(capture, 'barge', (update) => {
+            runtime.bargeScores = (runtime.bargeScores ?? 0) + 1
+            const score = Number(update.score)
+            if (Number.isFinite(score)) runtime.bargeBest = Math.max(runtime.bargeBest ?? 0, score)
+            if (!Number.isFinite(score) || score < 0.65) return
+            const context = runtime.audioContext
+            const stamp = context ? context.currentTime : 0
+            const windows = runtime.muteWindows ?? []
+            if (windows.some(window => stamp >= window.start - 0.1 && stamp <= window.end)) {
+              runtime.bargeRejected = (runtime.bargeRejected ?? 0) + 1
               return
             }
-            if (heard && now - speechStarted > 9000) {
-              void controller.finishBarge(capture, {
-                startMs: Math.max(0, speechStarted - 400 - startedAt),
-                endMs: Math.max(0, lastVoice + 700 - startedAt),
-              })
+            if (Date.now() - startedAt < 900) return
+            // Эхо-проверка только когда ей можно верить: если коэффициент эха не
+            // оценён, доверяем модели. Уровень берём из того же потока, что слышит
+            // модель, а не из анализатора: он на этом захвате молчит.
+            const threshold = THRESHOLDS[store.get().preferences.sensitivity] ?? THRESHOLDS.normal
+            const level = Number(update.level) || capture.amplitude()
+            const gain = runtime.bargeEchoGain
+            if (Number.isFinite(gain) && gain > 0 && level > 0) {
+              const residual = level - gain * controller.outputLevel() * 1.15
+              if (residual < threshold * 1.2) {
+                runtime.bargeGated = (runtime.bargeGated ?? 0) + 1
+                return
+              }
             }
-          }, 80)
+            void controller.bargeConfirmed()
+          })
+        },
+        /** Имя услышано во время чтения: останавливаем ответ и слушаем команду. */
+        async bargeConfirmed() {
+          const capture = runtime.bargeCapture
+          clearInterval(runtime.bargeTimer)
+          runtime.bargeTimer = undefined
+          runtime.bargeCapture = undefined
+          runtime.bargeHits = (runtime.bargeHits ?? 0) + 1
+          runtime.bargeBusy = true
+          try {
+            if (capture) {
+              try { capture.detachWake?.() } catch { /* поток уже отключён */ }
+              await capture.stop().catch(() => undefined)
+              await capture.dispose().catch(() => undefined)
+            }
+          } finally {
+            runtime.bargeBusy = false
+          }
+          if (store.get().phase !== 'speaking') return
+          controller.stopSpeaking()
+          controller.notice(store.get().strings.wakeHeard)
+          const target = controller.lastEnv
+          if (!target) return
+          // Перед записью освобождаем микрофон от прослушивания имени, иначе
+          // устройство остаётся занятым и запись падает с «микрофон занят».
+          await controller.stopWake().catch(() => undefined)
+          // Даём Windows долю секунды освободить устройство перед записью.
+          await delay(250)
+          runtime.wakeFollowUp = true
+          runtime.wakeFollowAttempts = 0
+          await controller.startRecording(target, { quiet: true })
+          // Если запись не встала с первого раза, повторяем молча: после
+          // прерывания пользователь не должен видеть ошибку микрофона.
+          if (!runtime.capture) {
+            await delay(400)
+            await controller.startRecording(target, { quiet: true }).catch(() => undefined)
+          }
+          // Если запись не началась (микрофон занят или env пустой), всё равно
+          // возвращаемся к прослушиванию имени, а не остаёмся в тишине.
+          setTimeout(() => {
+            if (store.get().phase !== 'idle') return
+            if (runtime.capture) return
+            void controller.ensureWake()
+          }, 500)
         },
         async stopBarge() {
           clearInterval(runtime.bargeTimer)
@@ -1766,6 +1903,47 @@ window.__ModuleLoader__.load({
           const capture = runtime.bargeCapture
           runtime.bargeCapture = undefined
           if (capture) await capture.dispose()
+        },
+        /**
+         * Переспросить имя в тишине, когда в записи оказался мой же голос из
+         * колонок. Чтение в этот момент стоит на паузе, поэтому окно чистое.
+         */
+        async askForName() {
+          if (store.get().phase !== 'speaking') return false
+          playReadyChime()
+          await delay(650)
+          const capture = new Capture()
+          try {
+            await capture.start()
+          } catch { return false }
+          try {
+            const startedAt = Date.now()
+            let heard = false
+            let lastVoice = startedAt
+            const threshold = (THRESHOLDS[store.get().preferences.sensitivity] ?? THRESHOLDS.normal) * 0.8
+            await new Promise((resolve) => {
+              const timer = setInterval(() => {
+                if (store.get().phase !== 'speaking') { clearInterval(timer); resolve(); return }
+                const now = Date.now()
+                capture.resume()
+                const level = capture.amplitude()
+                if (level >= threshold) {
+                  heard = true
+                  lastVoice = now
+                }
+                if (heard && now - lastVoice >= 600) { clearInterval(timer); resolve(); return }
+                if (!heard && now - startedAt > 1300) { clearInterval(timer); resolve(); return }
+                if (now - startedAt > 3200) { clearInterval(timer); resolve() }
+              }, 80)
+            })
+            const result = await capture.stop().catch(() => undefined)
+            if (!result || result.seconds < 0.2) return false
+            const score = await controller.scoreWave(result.wave)
+            runtime.bargeRetryScore = score
+            return typeof score === 'number' && score >= 0.85
+          } finally {
+            await capture.dispose().catch(() => undefined)
+          }
         },
         /** Разобрать фразу, сказанную поверх ответа. */
         async finishBarge(capture, segment) {
@@ -1777,13 +1955,27 @@ window.__ModuleLoader__.load({
             const result = await capture.stop().catch(() => undefined)
             if (!result || result.seconds < 0.25) { controller.resumeSpeaking(); return }
             const wave = segment ? trimWave(result.wave, segment.startMs, segment.endMs) : result.wave
+            // Сначала KWS-модель: короткое имя поверх чтения она слышит надёжнее
+            // распознавателя, который в шуме колонок отдаёт обрывки ответа.
+            const score = await controller.scoreWave(wave)
+            runtime.bargeScore = score
             const text = await controller.transcribeWake(wave)
+            runtime.bargeText = String(text ?? '').slice(0, 40)
             const match = matchWakePhrase(text, store.get().preferences.wakeWords)
-            if (!match.hit) {
-              controller.resumeSpeaking()
-              return
+            const heardName = match.hit || (typeof score === 'number' && score >= 0.9)
+            if (!heardName) {
+              // Скорее всего, в записи был мой же голос из колонок. Чтение уже
+              // стоит на паузе, поэтому зовём повторить имя в тишине: сигнал
+              // «готов слушать» и чистое окно 2 секунды.
+              const confirmed = await controller.askForName()
+              if (!confirmed) {
+                controller.resumeSpeaking()
+                return
+              }
+              runtime.bargeAnswers = (runtime.bargeAnswers ?? 0) + 1
             }
-            const rest = stripWakeFillers(match.rest)
+            const rest = match.hit ? stripWakeFillers(match.rest) : ''
+            runtime.bargeHits = (runtime.bargeHits ?? 0) + 1
             // «Валера, стоп» — гасим озвучку и ничего не записываем.
             if (isStopPhrase(rest)) {
               controller.stopSpeaking()
@@ -1802,12 +1994,13 @@ window.__ModuleLoader__.load({
             await controller.startRecording(target)
           } finally {
             runtime.bargeBusy = false
-            if (store.get().phase === 'speaking' && runtime.audio && runtime.bargeTriggers < 2) {
+            if (store.get().phase === 'speaking' && runtime.audio && runtime.bargeTriggers < 6) {
               setTimeout(() => { void controller.startBarge() }, 400)
             }
           }
         },
-        async startRecording(env) {
+        async startRecording(env, options) {
+          options = options ?? {}
           if (!env || !env.sessionId) return
           if (env.pendingInteraction) { controller.notice(store.get().strings.pendingQuestion); return }
           if (env.running) { controller.notice(store.get().strings.busy); return }
@@ -1845,13 +2038,14 @@ window.__ModuleLoader__.load({
             await capture.dispose()
             if (generation !== runtime.generation) return
             if (startError instanceof CaptureError && startError.message === 'cancelled') return
+            runtime.lastCaptureError = String(startError && startError.message ? startError.message : startError).slice(0, 48)
             const strings = store.get().strings
             const message = startError instanceof CaptureError && startError.message === 'permission' ? strings.micDenied
               : startError instanceof CaptureError && startError.message === 'missing' ? strings.micMissing
                 : startError instanceof CaptureError && startError.message === 'busy' ? strings.micBusy
-                  : strings.network
+                  : strings.micFailed
             store.set({ enabled: false })
-            controller.fail(message)
+            if (options.quiet !== true) controller.fail(message)
             return
           }
           runtime.starting = false
@@ -2328,8 +2522,26 @@ window.__ModuleLoader__.load({
             runtime.audioContext = new Ctor()
             runtime.playNodes = []
             runtime.playCursor = 0
+            // Анализатор на выходе: по нему знаем, что звучит прямо сейчас, и
+            // вычитаем этот уровень из микрофона как собственное эхо.
+            runtime.playGain = runtime.audioContext.createGain()
+            runtime.playAnalyser = runtime.audioContext.createAnalyser()
+            runtime.playAnalyser.fftSize = 2048
+            runtime.playGain.connect(runtime.playAnalyser)
+            runtime.playAnalyser.connect(runtime.audioContext.destination)
+            runtime.playSamples = new Float32Array(2048)
           }
           return runtime.audioContext
+        },
+        /** Уровень моего собственного воспроизведения прямо сейчас (RMS). */
+        outputLevel() {
+          const analyser = runtime.playAnalyser
+          if (!analyser) return 0
+          const buffer = runtime.playSamples ?? (runtime.playSamples = new Float32Array(analyser.fftSize))
+          analyser.getFloatTimeDomainData(buffer)
+          let sum = 0
+          for (let index = 0; index < buffer.length; index += 1) sum += buffer[index] * buffer[index]
+          return Math.sqrt(sum / buffer.length)
         },
         stopPlaybackNodes() {
           const nodes = runtime.playNodes ?? []
@@ -2340,10 +2552,29 @@ window.__ModuleLoader__.load({
           runtime.playCursor = 0
         },
         async speak(text, generation) {
+          runtime.speakCalls = (runtime.speakCalls ?? 0) + 1
           runtime.speechCanceled = false
+          // Бюджет пауз и профиль эха — свои на каждый ответ: раньше счётчик
+          // копился между ответами, и прерывание «замолкало» после нескольких раз.
+          runtime.bargeTriggers = 0
+          runtime.bargeEcho = 0
+          runtime.bargeHistory = []
+          runtime.bargePeak = 0
           const preferences = store.get().preferences
           const cleaned = cleanForSpeech(text)
           if (cleaned === '') return
+          // Если в самом ответе встречается кодовое слово, прерывание по имени на
+          // этот фрагмент выключаем: иначе я перебиваю себя, читая «Валера» вслух.
+          // Кодовые слова хранятся строкой через запятую, а не массивом.
+          const wakeList = String(preferences.wakeWords ?? '')
+            .split(',')
+            .map(word => word.trim())
+            .filter(Boolean)
+          const wakeSample = wakeList.find(word => word.length >= 4) ?? ''
+          // Окна «где звучит само имя» пока отключены: при живом разговоре они
+          // глушили прерывание во всём ответе. Включить — вернуть toLowerCase().
+          const wakeSampleLower = ''
+          runtime.muteWindows = []
           // Один и тот же ответ не озвучиваем дважды: событие конца хода и
           // «чужой» ход могут прийти почти одновременно.
           const fingerprint = `${cleaned.length}:${cleaned.slice(0, 120)}`
@@ -2384,6 +2615,9 @@ window.__ModuleLoader__.load({
           const marker = { paused: false }
           runtime.audio = marker
           runtime.audioCancel = () => { runtime.speechCanceled = true; controller.stopPlaybackNodes() }
+          // Слушаем кодовое слово во время чтения: с переходом на AudioContext
+          // этот вызов потерялся, и прервать ответ голосом было нельзя.
+          void controller.startBarge()
           try {
             // Планируем буферы подряд: следующий начинается ровно там, где
             // закончился предыдущий, поэтому между фразами нет провалов.
@@ -2425,8 +2659,14 @@ window.__ModuleLoader__.load({
               const startAt = Math.max(cursor, context.currentTime + 0.02)
               const source = context.createBufferSource()
               source.buffer = buffer
-              source.connect(context.destination)
+              source.connect(runtime.playGain ?? context.destination)
               source.start(startAt)
+              // Если в этой фразе звучит само кодовое слово, прерывание
+              // в её окне игнорируем: иначе я перебиваю себя.
+              if (wakeSampleLower !== '' && String(blocks[index] ?? "").toLowerCase().includes(wakeSampleLower)) {
+                const windows = runtime.muteWindows ?? (runtime.muteWindows = [])
+                windows.push({ start: startAt, end: startAt + buffer.duration + 0.2 })
+              }
               cursor = startAt + buffer.duration
               runtime.playCursor = cursor
               runtime.playNodes.push(source)
@@ -2447,8 +2687,14 @@ window.__ModuleLoader__.load({
               const startAt = Math.max(cursor, context.currentTime + 0.02)
               const source = context.createBufferSource()
               source.buffer = buffer
-              source.connect(context.destination)
+              source.connect(runtime.playGain ?? context.destination)
               source.start(startAt)
+              // Если в этой фразе звучит само кодовое слово, прерывание
+              // в её окне игнорируем: иначе я перебиваю себя.
+              if (wakeSampleLower !== '' && String(blocks[index] ?? "").toLowerCase().includes(wakeSampleLower)) {
+                const windows = runtime.muteWindows ?? (runtime.muteWindows = [])
+                windows.push({ start: startAt, end: startAt + buffer.duration + 0.2 })
+              }
               cursor = startAt + buffer.duration
               runtime.playCursor = cursor
               runtime.playNodes.push(source)
@@ -2687,14 +2933,18 @@ window.__ModuleLoader__.load({
           const state = store.get()
           const env = controller.lastEnv
           return `phase=${state.phase} mic=${state.preferences.micOn === true} wake=${state.wakeListening}`
+            + ` out=${store.get().preferences.output} actx=${runtime.audioContext?.state ?? 'none'} gain=${(runtime.playGain?.gain?.value ?? -1).toFixed(2)} muted=${Boolean(runtime.bargeMuted)} mute=${Boolean(runtime.speechCanceled)}`
+            + ` spkN=${runtime.speakCalls ?? 0}/${String(runtime.speakError ?? '').slice(0, 24)}`
+            + ` rej=${runtime.bargeRejected ?? 0}/${runtime.bargeGated ?? 0} mw=${(runtime.muteWindows ?? []).length} startsat=${runtime.bargeStartAgo ?? 0}`
             + ` run=${env ? env.running === true : 'none'} pend=${Boolean(runtime.pending)}`
             + ` aud=${Boolean(runtime.audio)} tts=${Boolean(runtime.ttsAbort)}`
             + ` cap=${Boolean(runtime.capture)} wcap=${Boolean(runtime.wakeCapture)}`
             + ` busy=${Boolean(runtime.wakeBusy)} next=${Math.max(0, Math.round((runtime.wakeNextAt - Date.now()) / 1000))}`
             + ` starts=${runtime.wakeStarts} fails=${runtime.wakeFails} resp=${runtime.wakeResponses}`
-            + ` spk=${state.speakIndex ?? 0}/${state.speakTotal ?? 0}` + ` skip=${state.speakSkipped ?? 0}` + ` ctx=${runtime.wakeCapture?.context?.state ?? 'none'} lvl=${state.level.toFixed(2)}`
+            + ` spk=${state.speakIndex ?? 0}/${state.speakTotal ?? 0}` + ` skip=${state.speakSkipped ?? 0}` + ` brg=${runtime.bargeStarts ?? 0}/${runtime.bargePauses ?? 0}/${runtime.bargeHits ?? 0} pk=${(runtime.bargePeak ?? 0).toFixed(3)} echo=${(runtime.bargeEcho ?? 0).toFixed(3)} bsc2=${runtime.bargeScores ?? 0}/${(runtime.bargeBest ?? 0).toFixed(2)} err=${String(runtime.bargeError ?? "").slice(0, 24)} btxt=${String(runtime.bargeText ?? "").slice(0, 24)} bsc=${(typeof runtime.bargeScore === "number" ? runtime.bargeScore : 0).toFixed(2)} ask=${runtime.bargeAnswers ?? 0}/${(typeof runtime.bargeRetryScore === "number" ? runtime.bargeRetryScore : 0).toFixed(2)}` + ` ctx=${runtime.wakeCapture?.context?.state ?? 'none'} lvl=${state.level.toFixed(2)}`
             + ` el=${Math.round((Date.now() - (runtime.wakeStartedAt || Date.now())) / 1000)} ring=${(runtime.wakeRing.samples / 16000).toFixed(1)}s segs=${runtime.wakeSegs} smp=${runtime.wakeSegSamples} segtxt=${runtime.wakeSegText}` + ` hits=${runtime.wakeHits} calls=${runtime.wakeCalls} peak=${runtime.wakePeak.toFixed(3)} sr=${runtime.wakeCapture?.context?.sampleRate ?? 0} txt=${(runtime.wakeLastText || '').slice(0, 30)}` + ` host=${runtime.wakeHost ? (runtime.wakeHost.speech ? 'sp' : 'sil') + '/' + runtime.wakeHost.silenceMs : 'none'}`
-            + ` err=${String(state.error).slice(0, 40)}`
+            + ` err=${String(state.error).slice(0, 40)} cerr=${String(runtime.lastCaptureError ?? '').slice(0, 32)}`
+            + ` out=${store.get().preferences.output} actx=${runtime.audioContext?.state ?? 'none'} gain=${(runtime.playGain?.gain?.value ?? -1).toFixed(2)} muted=${Boolean(runtime.bargeMuted)}`
         },
         /**
          * Сторож застрявшей фазы: если запись не идёт, звука нет и ответ не
