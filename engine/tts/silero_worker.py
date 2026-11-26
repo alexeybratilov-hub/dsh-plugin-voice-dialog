@@ -25,6 +25,7 @@ import traceback
 import wave
 import translit_en
 import numerals_ru
+import units_ru
 
 # Take the reply channel before importing the engine: PyTorch prints runtime
 # warnings on stdout, and that must never land in the JSON stream.
@@ -415,8 +416,11 @@ def synthesize_english_silero(segment: str) -> np.ndarray | None:
         return None
 
 def synthesize(text: str, speaker: str, pause_scale: float = 1.0, rate_percent: int = 100) -> np.ndarray:
-    # Цифры русская модель не читает: «123» давало ноль секунд звука.
-    text = numerals_ru.replace_numbers(sanitize_for_tts(text))
+    # Сокращения и единицы — словами, затем цифры, затем род числительного.
+    text = sanitize_for_tts(text)
+    text = units_ru.expand_units(text)
+    text = numerals_ru.replace_numbers(text)
+    text = units_ru.fix_feminine(text)
     # Совсем без букв (цифры, знаки) произносить нечего.
     if not re.search(r"[A-Za-z\u0400-\u04FF]", text):
         return np.zeros(0, dtype=np.float32)
